@@ -1,13 +1,8 @@
-# Add your own tasks in files placed in lib/tasks ending in .rake,
-# for example lib/tasks/capistrano.rake, and they will automatically be available to Rake.
+# frozen_string_literal: true
 
 require File.expand_path('../config/application', __FILE__)
 
 Rails.application.load_tasks
-
-task :default do
-  Brakeman.run :app_path => ".", :print_report => true
-end
 
 namespace :justask do
   desc "Regenerate themes"
@@ -60,49 +55,36 @@ namespace :justask do
 
   desc "Recount everything!"
   task recount: :environment do
-    format = '%t (%c/%C) [%b>%i] %e'
-    total = User.count
-    progress = ProgressBar.create title: 'Processing users', format: format, starting_at: 0, total: total
-    User.all.each do |user|
-      begin
-        answered = Answer.where(user: user).count
-        asked = Question.where(user: user).where(author_is_anonymous: false).count
-        commented = Comment.where(user: user).count
-        smiled = Smile.where(user: user).count
-        user.friend_count = user.friends.count
-        user.follower_count = user.followers.count
-        user.answered_count = answered
-        user.asked_count = asked
-        user.commented_count = commented
-        user.smiled_count = smiled
-        user.save!
-      end
-      progress.increment
-    end
+    puts "Processing users..."
+    ActiveRecord::Base.connection.execute <<~SQL
+      update users set
+        friend_count         = (select count(*) from relationships  where source_id = users.id),
+        follower_count       = (select count(*) from relationships  where target_id = users.id),
+        asked_count          = (select count(*) from questions      where user_id   = users.id and author_name is null and author_is_anonymous = false),
+        answered_count       = (select count(*) from answers        where user_id   = users.id),
+        commented_count      = (select count(*) from comments       where user_id   = users.id),
+        smiled_count         = (select count(*) from smiles         where user_id   = users.id),
+        comment_smiled_count = (select count(*) from comment_smiles where user_id   = users.id);
+    SQL
 
-    total = Question.count
-    progress = ProgressBar.create title: 'Processing questions', format: format, starting_at: 0, total: total
-    Question.all.each do |question|
-      begin
-        answers = Answer.where(question: question).count
-        question.answer_count = answers
-        question.save!
-      end
-      progress.increment
-    end
+    puts "Processing questions..."
+    ActiveRecord::Base.connection.execute <<~SQL
+      update questions set
+        answer_count = (select count(*) from answers where question_id = questions.id);
+    SQL
 
-    total = Answer.count
-    progress = ProgressBar.create title: 'Processing answers', format: format, starting_at: 0, total: total
-    Answer.all.each do |answer|
-      begin
-        smiles = Smile.where(answer: answer).count
-        comments = Comment.where(answer: answer).count
-        answer.comment_count = comments
-        answer.smile_count = smiles
-        answer.save!
-      end
-      progress.increment
-    end
+    puts "Processing answers..."
+    ActiveRecord::Base.connection.execute <<~SQL
+      update answers set
+        comment_count = (select count(*) from comments where answer_id = answers.id),
+        smile_count   = (select count(*) from smiles where answer_id = answers.id);
+    SQL
+
+    puts "Processing comments..."
+    ActiveRecord::Base.connection.execute <<~SQL
+      update comments set
+        smile_count = (select count(*) from comment_smiles where comment_id = comments.id);
+    SQL
   end
 
   desc "Gives admin status to a user."
@@ -403,23 +385,34 @@ namespace :justask do
 
   desc "Prints lonely people."
   task loners: :environment do
-    people = {}
-    Question.all.each do |q|
-      if q.author_is_anonymous and q.author_name != 'justask'
-        q.answers.each do |a|
-          if q.user == a.user
-            people[q.user.screen_name] ||= 0
-            people[q.user.screen_name] += 1
-            puts "#{q.user.screen_name} -- answer id #{a.id}"
-          end
-        end
-      end
+    Answer.find_by_sql(<<~SQL).each do |a|
+      select answers.id, answers.user_id
+      from answers
+      inner join questions on answers.question_id = questions.id
+      inner join users     on answers.user_id     = users.id
+      where (questions.author_is_anonymous = true)
+      and (questions.author_name is null)
+      and (answers.user_id = questions.user_id)
+      order by users.screen_name, answers.id;
+    SQL
+      puts "#{a.user.screen_name} -- answer id #{a.id}"
     end
 
-    max = 0
-    res = []
-    people.each { |k, v| max = v if v > max }
-    people.each { |k, v| res << k if v == max }
+    loner_counts = ActiveRecord::Base.connection.execute <<~SQL
+      select users.screen_name, count(*)
+      from answers
+      inner join questions on answers.question_id = questions.id
+      inner join users     on answers.user_id     = users.id
+      where (questions.author_is_anonymous = true)
+        and (questions.author_name is null)
+        and (answers.user_id = questions.user_id)
+      group by users.screen_name
+      order by count desc;
+    SQL
+
+    max_count = loner_counts.map { |res| res["count"] }.max
+    res = loner_counts.select { |res| res["count"] == max_count }.map { |res| res["screen_name"] }
+
     if res.length == 0
       puts "No one?  I hope you're just on the development session."
     else
